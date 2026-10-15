@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Validate, scan, build, and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 1. Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install validation tools
+        run: python -m pip install --disable-pip-version-check yamllint PyYAML
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.18.4
+
+      - name: 2. Lint and validate project files
+        run: python checks/check_project.py
+
+      - name: 3. Scan source and configuration
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+      - name: Scan Dockerfile and Kubernetes manifests
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+      - name: 4. Build container image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: docker build --tag self-healing-demo:${IMAGE_TAG} .
+
+      - name: 5. Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.4.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Scan built image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: self-healing-demo:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+      - name: Skip publishing pull request builds
+        if: github.event_name == 'pull_request'
+        run: echo 'Pull request validation completed; image publication is disabled.'
+
+      - name: Configure AWS credentials with GitHub OIDC
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Ensure ECR repository exists
+        if: github.ref == 'refs/heads/main'
+        env:
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          test -n "$REPOSITORY" || { echo 'Set the ECR_REPOSITORY variable.'; exit 1; }
+          if REPOSITORY_INFO="$(aws ecr describe-repositories --repository-names "$REPOSITORY" --region "$REGION" 2>&1)"; then
+            echo "ECR repository '$REPOSITORY' already exists."
+          elif grep -q 'RepositoryNotFoundException' <<< "$REPOSITORY_INFO"; then
+            echo "ECR repository '$REPOSITORY' is missing; creating it."
+            if ! aws ecr create-repository \
+              --repository-name "$REPOSITORY" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256 \
+              --region "$REGION"; then
+              # Another CI run may have created the repository in the meantime.
+              aws ecr describe-repositories --repository-names "$REPOSITORY" --region "$REGION" >/dev/null
+            fi
+          else
+            echo "$REPOSITORY_INFO"
+            exit 1
+          fi
+
+      - name: Log in to Amazon ECR
+        if: github.ref == 'refs/heads/main'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 6. Push image to ECR
+        if: github.ref == 'refs/heads/main'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test -n "$REPOSITORY" || { echo 'Set the ECR_REPOSITORY variable.'; exit 1; }
+          docker tag "self-healing-demo:${IMAGE_TAG}" "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          docker push "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+
+      - name: 7. Pull image from ECR to verify publication
+        if: github.ref == 'refs/heads/main'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: docker pull "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+
+      - name: 8. Report CD handoff
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo 'Image published. The CD workflow will request production approval before updating the GitOps branch.' >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"

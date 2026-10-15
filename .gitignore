@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+1791618170524.pdf

@@ -1,0 +1,171 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Full commit SHA tag already published in ECR
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: production
+    steps:
+      - name: Checkout trusted default branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.18.4
+
+      - name: Select image SHA
+        id: image
+        env:
+          DISPATCH_TAG: ${{ inputs.image_tag }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="${DISPATCH_TAG:-$CI_SHA}"
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{7,40}$ ]] || { echo 'Invalid image tag; use a commit SHA.'; exit 1; }
+          echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CD_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: 1. Validate EKS cluster access
+        env:
+          CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          test -n "$CLUSTER" || { echo 'Set EKS_CLUSTER_NAME in Actions variables.'; exit 1; }
+          aws eks describe-cluster --name "$CLUSTER" --region "$REGION" >/dev/null
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+
+      - name: 2. Install Argo CD once when absent
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! kubectl get deployment argocd-server -n argocd >/dev/null 2>&1; then
+            helm repo add argo https://argoproj.github.io/argo-helm
+            helm repo update argo
+            helm upgrade --install argocd argo/argo-cd \
+              --version 10.10.3 --namespace argocd --create-namespace \
+              --wait --timeout 10m
+          fi
+          kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=10m
+          python -m pip install --disable-pip-version-check PyYAML
+          python - <<'PY'
+          import os, yaml
+          from pathlib import Path
+          app = yaml.safe_load(Path('argocd/application.yaml').read_text())
+          app['spec']['source']['repoURL'] = f"https://github.com/{os.environ['REPOSITORY']}.git"
+          Path('/tmp/self-healing-application.yaml').write_text(yaml.safe_dump(app, sort_keys=False))
+          PY
+          kubectl apply -f /tmp/self-healing-application.yaml
+          kubectl get application self-healing-demo -n argocd
+
+      - name: 3. Prepare Helm image values on GitOps branch
+        id: update
+        env:
+          IMAGE_REPOSITORY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check PyYAML
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin gitops
+          git checkout -B gitops origin/gitops
+          PREVIOUS_TAG="$(python -c 'import yaml; print(yaml.safe_load(open("helm/app/values.yaml"))["image"]["tag"])')"
+          echo "previous_tag=$PREVIOUS_TAG" >> "$GITHUB_OUTPUT"
+          IMAGE_REPOSITORY="$IMAGE_REPOSITORY" python .github/scripts/update_image.py "$IMAGE_TAG"
+          git add helm/app/values.yaml
+          if git diff --cached --quiet; then
+            echo 'GitOps branch already points at this image.'
+          else
+            git commit -m "deploy: self-healing-demo ${IMAGE_TAG}"
+            git push origin HEAD:gitops
+          fi
+
+      - name: 4. Wait for Argo CD sync and Kubernetes rollout
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 48); do
+            ACTUAL="$(kubectl get deployment self-healing-demo -n self-healing-demo -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            [[ "$ACTUAL" == *":${IMAGE_TAG}" ]] && break
+            sleep 10
+          done
+          [[ "$ACTUAL" == *":${IMAGE_TAG}" ]] || { echo "Argo CD did not sync image ${IMAGE_TAG}; current image is ${ACTUAL:-unavailable}"; exit 1; }
+          kubectl rollout status deployment/self-healing-demo -n self-healing-demo --timeout=8m
+
+      - name: 5. Roll back GitOps image pin if rollout fails
+        if: failure() && steps.update.outputs.previous_tag != '' && steps.update.outputs.previous_tag != 'bootstrap'
+        env:
+          PREVIOUS_TAG: ${{ steps.update.outputs.previous_tag }}
+          IMAGE_REPOSITORY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check PyYAML
+          git fetch origin gitops
+          git checkout -B gitops origin/gitops
+          PREVIOUS_TAG="$PREVIOUS_TAG" IMAGE_REPOSITORY="$IMAGE_REPOSITORY" python - <<'PY'
+          import os, yaml
+          from pathlib import Path
+          path = Path('helm/app/values.yaml')
+          data = yaml.safe_load(path.read_text())
+          data['image']['repository'] = os.environ['IMAGE_REPOSITORY']
+          data['image']['tag'] = os.environ['PREVIOUS_TAG']
+          path.write_text(yaml.safe_dump(data, sort_keys=False))
+          PY
+          git add helm/app/values.yaml
+          git commit -m "rollback: restore image ${PREVIOUS_TAG}" || exit 0
+          git push origin HEAD:gitops
+          echo 'Rollback image pin committed; Argo CD will sync the previous release.'
+
+      - name: 6. Report application URL
+        if: success()
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            URL="$(kubectl get service self-healing-demo -n self-healing-demo -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+            [ -n "$URL" ] && break
+            sleep 10
+          done
+          if [ -n "${URL:-}" ]; then
+            echo "Application URL: http://${URL}" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Deployment is healthy; the AWS load balancer hostname is still provisioning.' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
