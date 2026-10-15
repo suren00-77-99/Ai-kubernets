@@ -8,22 +8,23 @@ An educational GitHub Actions project that validates an application, scans and b
 
 ```mermaid
 flowchart TD
-  A[Developer push to main] --> B[CI: checkout and file-aware checks]
-  B --> C[Trivy source and config scans]
-  C --> D[Docker build and image scan]
-  D --> E[OIDC login and push image to ECR]
-  E --> F[CD waits for production environment approval]
-  F --> G[Validate EKS and bootstrap Argo CD once]
-  G --> H[Pin image SHA on gitops branch]
-  H --> I[Argo CD syncs Helm chart]
-  I --> J[Kubernetes rollout and app URL]
-  J -->|failure| K[Restore prior image tag on gitops branch]
-  B -->|check failure| L[Gemini proposes one allowlisted file repair]
-  L --> M[Run checks again]
-  M --> N[Open pull request for human review]
+  A[Developer push to main] --> B[Checkout and lint]
+  B --> C[Run unit tests]
+  C --> D[Build container image]
+  D --> E[Scan built image]
+  E --> F[Push image to ECR]
+  F --> G[CD waits for production environment approval]
+  G --> H[Validate EKS and bootstrap Argo CD once]
+  H --> I[Pin image SHA on gitops branch]
+  I --> J[Argo CD syncs Helm chart]
+  J --> K[Kubernetes rollout and app URL]
+  K -->|failure| L[Restore prior image tag on gitops branch]
+  B -->|check failure| M[Gemini proposes one allowlisted file repair]
+  M --> N[Run checks again]
+  N --> O[Open pull request for human review]
 ```
 
-CI jobs on pull requests run validation, scans, and a local image build but do not receive AWS credentials or publish to ECR. The CD workflow only runs after a successful `main` CI run, or a manual dispatch. GitOps state is written to a separate `gitops` branch so Argo CD can continuously reconcile the Helm release.
+CI jobs on pull requests run lint, unit tests, a local image build, and an image scan but do not receive AWS credentials or publish to ECR. On `main`, a successful image scan is followed by ECR publication; the CD workflow starts after the CI run succeeds. GitOps state is written to a separate `gitops` branch so Argo CD can continuously reconcile the Helm release.
 
 ## Repository layout
 
@@ -35,7 +36,7 @@ Ai-project/
 ├── checks/check_project.py        Python, HTML, YAML, shell, and Helm checks
 ├── helm/app/                      Kubernetes Helm chart
 ├── argocd/application.yaml        Argo CD Application definition
-├── .github/workflows/ci.yml       Lint, scan, build, push, and pull image
+├── .github/workflows/ci.yml       Lint, unit test, build, scan, and push image
 ├── .github/workflows/cd.yml       Approval, EKS, GitOps update, rollout/rollback
 └── .github/workflows/autofix.yml  Gemini diagnosis and review PR
 ```
@@ -56,7 +57,7 @@ Open `http://localhost:8080` to see the application. Alternatively, `./run-local
 
 This is only a local preview. The EKS pipeline does not call `run-local.sh`; GitHub Actions builds and publishes the image, and Argo CD deploys it to your cluster.
 
-The checker is intentionally deterministic. It checks HTML structure, Python syntax, YAML formatting/syntax, shell syntax, the Dockerfile, and Helm lint/render output. The web container runs as a non-root user with a read-only root filesystem and serves on port 8080. Scanners and image build are separate CI steps so failures are visible as separate stages.
+The lint checker is intentionally deterministic. It checks HTML structure, Python syntax, YAML formatting/syntax, shell syntax, the Dockerfile, and Helm lint/render output. Unit tests exercise the HTML checker. The web container runs as a non-root user with a read-only root filesystem and serves on port 8080. CI builds the image before scanning it, then publishes it to ECR only after the scan passes.
 
 ## 2. Create AWS resources
 
@@ -120,7 +121,7 @@ Argo CD watches `gitops`, not `main`. CI/CD source commits and release pins are 
 ## 4. Start the pipeline
 
 1. Commit and push a change to `main`.
-2. In **Actions → CI**, follow the ordered stages: checks, source/config scan, Docker build, Dockerfile lint, image scan, ensure/create ECR repository, ECR push, and ECR pull verification.
+2. In **Actions → CI**, follow the ordered stages: checkout, lint, unit tests, Docker build, image scan, ECR repository ensure/create, and ECR push.
 3. After CI succeeds, **Actions → CD** waits at the `production` environment approval gate.
 4. Approve the deployment. CD validates EKS, installs Helm CLI, installs Argo CD only if it is not already present, applies the Argo Application, and updates `helm/app/values.yaml` on `gitops` to the exact commit SHA.
 5. Argo CD automatically syncs the Helm chart. CD waits for the Kubernetes rollout and reports the load balancer URL in the workflow summary.
