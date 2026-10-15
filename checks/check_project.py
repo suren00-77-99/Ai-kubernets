@@ -15,8 +15,10 @@ def project_files():
             yield path
 
 
-def report(command, relative):
-    result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+def report(command, relative, input_text=None):
+    result = subprocess.run(
+        command, cwd=ROOT, text=True, capture_output=True, input=input_text
+    )
     if result.returncode:
         print(f"FAIL {relative}\n{result.stdout}{result.stderr}".rstrip())
         return False
@@ -38,12 +40,22 @@ def main():
                 print(f"FAIL {relative}: {exc}")
                 ok = False
         elif path.suffix.lower() in {".yml", ".yaml"}:
-            ok = report(["yamllint", "-d", "{extends: relaxed, rules: {line-length: disable, truthy: disable}}", relative], relative) and ok
+            if "templates" in path.parts:
+                # Helm templates contain Go template expressions that are not
+                # valid YAML until Helm renders them. Helm lint/template below
+                # validates these files after rendering.
+                print(f"SKIP raw YAML lint (Helm template): {relative}")
+            else:
+                ok = report(["yamllint", "-d", "{extends: relaxed, rules: {line-length: disable, truthy: disable}}", relative], relative) and ok
         elif path.suffix == ".sh":
             ok = report(["bash", "-n", relative], relative) and ok
     dockerfile = ROOT / "Dockerfile"
     if dockerfile.exists():
-        ok = report(["docker", "run", "--rm", "-v", f"{dockerfile}:/Dockerfile:ro", "hadolint/hadolint:v2.15.1", "/Dockerfile"], "Dockerfile") and ok
+        ok = report(
+            ["docker", "run", "--rm", "-i", "hadolint/hadolint:v2.15.1"],
+            "Dockerfile",
+            input_text=dockerfile.read_text(encoding="utf-8"),
+        ) and ok
     chart = ROOT / "helm/app"
     if chart.exists():
         ok = report(["helm", "lint", "helm/app"], "helm/app") and ok
