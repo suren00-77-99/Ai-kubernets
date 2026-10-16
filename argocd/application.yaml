@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/REPLACE_WITH_OWNER/REPLACE_WITH_REPO.git
+    repoURL: https://github.com/suren00-77-99/Ai-kubernets.git
     targetRevision: gitops
     path: helm/app
     helm:
