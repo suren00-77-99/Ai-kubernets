@@ -3,6 +3,10 @@ kind: Application
 metadata:
   name: self-healing-demo
   namespace: argocd
+  annotations:
+    notifications.argoproj.io/subscribe.on-sync-failed.github-dispatch: ""
+    notifications.argoproj.io/subscribe.on-sync-status-unknown.github-dispatch: ""
+    notifications.argoproj.io/subscribe.on-health-degraded.github-dispatch: ""
 spec:
   project: default
   source:

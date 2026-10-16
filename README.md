@@ -95,7 +95,7 @@ You can also use this as a subdirectory in an existing repository, but adjust wo
 | `AWS_ACCOUNT_ID` | Variable | 12-digit AWS account ID |
 | `ECR_REPOSITORY` | Variable | `self-healing-demo` (repository name only) |
 
-Add `GEMINI_API_KEY` as a repository secret; do not put the key in a workflow file. The current Gemini model default is `gemini-3.8-flash`; set `GEMINI_MODEL` in the autofix workflow if you want another model. Gemini is called only when a failed CI log identifies one supported file.
+Add `GEMINI_API_KEY` as a repository secret; do not put the key in a workflow file. The current Gemini model default is `gemini-3.8-flash`; set `GEMINI_MODEL` in the autofix workflow if you want another model. Gemini is called only when a CI or Argo CD failure identifies one supported project file.
 
 In **Settings → Actions → General**, allow GitHub Actions to create pull requests. The publish job needs repository contents write permission so it can update the `gitops` branch. Validation runs in a separate job with read-only contents permission. Protect `main`; consider protecting the GitOps branch so only the workflow and authorized maintainers can update it.
 
@@ -119,11 +119,52 @@ Argo CD watches `gitops`, not `main`. CI pushes each scanned image to ECR with b
 3. Argo CD polls `gitops`, sees the Application is `OutOfSync`, renders `helm/app` using its built-in Helm engine, and applies the Kubernetes manifests to EKS.
 4. Check the Argo CD Application health and the app LoadBalancer URL. The Service listens on port 8080.
 
+### See the app and Argo CD UI
+
+From a machine with `kubectl` configured for EKS, get the public app LoadBalancer hostname:
+
+```sh
+kubectl get service self-healing-demo -n self-healing-demo -w
+```
+
+When `EXTERNAL-IP` shows an AWS hostname, open `http://<EXTERNAL-IP>:8080` in a browser. Stop watching with Ctrl+C after the hostname appears.
+
+The Argo CD server is internal by default, so it does not have a public URL. To open its UI securely, run this on a machine that can reach the EKS API:
+
+```sh
+kubectl port-forward service/argocd-server -n argocd 8080:443
+```
+
+Then open `https://localhost:8080`, sign in as `admin`, and get the initial password with:
+
+```sh
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 --decode; echo
+```
+
+The browser may show a certificate warning for this local port-forward. It does not make Argo CD public. Avoid changing the Argo CD Service to a public LoadBalancer unless you also configure TLS and restrict access.
+
 ## 5. Demonstrate AI-assisted repair
 
-Use a disposable feature branch. Make a small syntax or structure error in an application, checker, workflow, Argo CD, or Helm file, then push it to GitHub. The AI workflow listens for failed CI runs, reads the failed log, selects one allowlisted file, asks Gemini for a complete-file candidate, and runs the project checker, unit tests, and Docker build. If all pass, it opens a PR containing only that file. Infrastructure/API availability failures and scans without a clear file target do not trigger a speculative repair.
+Use a disposable feature branch. Make a small syntax or structure error in an application, checker, workflow, Argo CD, or Helm file, then push it to GitHub. The AI workflow listens for failed CI runs and Argo CD notifications, selects one allowlisted file when the failure identifies it, asks Gemini for a complete-file candidate, and runs the project checker, unit tests, and Docker build. If all pass, it opens a PR containing only that file. Infrastructure/API availability failures and errors without a clear file target do not trigger a speculative repair.
 
 Review the diff and CI results as you would any other code. The agent cannot merge the PR or deploy it. Do not put secrets or production data into test files. To test manually, dispatch **AI Autofix PR** and optionally specify an allowlisted `target_file`.
+
+### Connect Argo CD failures to Autofix
+
+Argo CD needs a GitHub fine-grained personal access token limited to this repository with **Contents: read and write** permission so its Notifications controller can send a `repository_dispatch` event. Keep this token in the cluster secret, not in GitHub Actions or a manifest file. After pushing these workflow and notification files to `main`, create the secret and apply the configuration from a machine with cluster access:
+
+```sh
+read -rsp 'GitHub dispatch token: ' GITHUB_DISPATCH_TOKEN; echo
+kubectl create secret generic argocd-notifications-secret -n argocd \
+  --from-literal=github-token="$GITHUB_DISPATCH_TOKEN" \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset GITHUB_DISPATCH_TOKEN
+kubectl apply -f argocd/notifications.yaml
+kubectl apply -f argocd/application.yaml
+```
+
+The configuration dispatches on failed syncs, unknown sync state, or degraded health. Autofix opens a PR only when the event points to a supported source file; it does not try to repair EKS/API availability or other infrastructure failures.
 
 ### EKS OpenAPI errors
 
@@ -143,7 +184,7 @@ If `/readyz` or `/openapi/v2` fails from `kubectl`, the problem is at the EKS AP
 
 ## What it can and cannot repair
 
-The Gemini workflow is a bounded repair proposal, not an autonomous production operator. It only attempts allowlisted file-level failures identified in CI logs. Argo CD runs independently and an application sync/health failure does not automatically create a GitHub workflow failure event; infrastructure errors, missing IAM permissions, exhausted quotas, runner failures, and vulnerability findings without a safe file-level correction do not trigger a speculative repair. A workflow YAML syntax error may prevent GitHub from starting the workflow, so no `workflow_run` event exists for the repair workflow to handle it. Model output is untrusted until reviewed and merged.
+The Gemini workflow is a bounded repair proposal, not an autonomous production operator. It attempts allowlisted file-level failures reported by CI or Argo CD notifications. Infrastructure errors, missing IAM permissions, exhausted quotas, runner failures, and vulnerability findings without a safe file-level correction do not trigger a speculative repair. A workflow YAML syntax error may prevent GitHub from starting the workflow, so no `workflow_run` event exists for the repair workflow to handle it. Model output is untrusted until reviewed and merged.
 
 ## Cost and safety notes
 

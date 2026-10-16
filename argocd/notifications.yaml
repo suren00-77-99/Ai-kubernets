@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  service.webhook.github-dispatch: |
+    url: https://api.github.com
+    headers:
+      - name: Authorization
+        value: Bearer $github-token
+      - name: Accept
+        value: application/vnd.github+json
+      - name: X-GitHub-Api-Version
+        value: '2022-11-28'
+      - name: Content-Type
+        value: application/json
+  trigger.on-sync-failed: |
+    - when: app.status?.operationState.phase in ['Error', 'Failed']
+      send: [argocd-failure]
+  trigger.on-sync-status-unknown: |
+    - when: app.status.sync.status == 'Unknown'
+      send: [argocd-failure]
+  trigger.on-health-degraded: |
+    - when: app.status.health.status == 'Degraded'
+      send: [argocd-failure]
+  template.argocd-failure: |
+    webhook:
+      github-dispatch:
+        method: POST
+        path: /repos/suren00-77-99/Ai-kubernets/dispatches
+        body: |
+          {
+            "event_type": "argocd_failure",
+            "client_payload": {
+              "application": {{.app.metadata.name | toJson}},
+              "sync": {{.app.status.sync.status | toJson}},
+              "health": {{.app.status.health.status | toJson}},
+              "conditions": {{.app.status.conditions | toJson}}
+            }
+          }

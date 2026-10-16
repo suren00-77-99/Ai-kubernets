@@ -15,6 +15,8 @@ RUN_ID = os.getenv("RUN_ID", "")
 FAILED_SHA = os.getenv("FAILED_SHA", "")
 BASE_BRANCH = os.getenv("BASE_BRANCH", "main")
 FAILED_WORKFLOW = os.getenv("FAILED_WORKFLOW", "")
+FAILURE_CONTEXT = os.getenv("FAILURE_CONTEXT", "")
+AUTOFIX_ID = os.getenv("AUTOFIX_ID", RUN_ID or "manual")
 MAX_LOG = 12_000
 BEGIN, END = "<<<BEGIN_FILE>>>", "<<<END_FILE>>>"
 
@@ -45,6 +47,8 @@ def command(args, check=True):
 
 def failure_context():
     if not RUN_ID:
+        if FAILURE_CONTEXT and FAILURE_CONTEXT != "null":
+            return f"Argo CD failure event (untrusted status details):\n{FAILURE_CONTEXT[-MAX_LOG:]}"
         return "Manual run: diagnose the current repository checks."
     result = command(["gh", "run", "view", RUN_ID, "--log-failed"], check=False)
     log = (result.stdout or result.stderr)[-MAX_LOG:]
@@ -107,7 +111,7 @@ def ask_gemini(target, current, log):
 
 
 def create_pr(target, check_output):
-    branch = f"autofix/run-{RUN_ID or 'manual'}"
+    branch = f"autofix/run-{AUTOFIX_ID}"
     command(["git", "config", "user.name", "github-actions[bot]"])
     command(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
     command(["git", "checkout", "-b", branch])
@@ -119,7 +123,7 @@ def create_pr(target, check_output):
     command(["git", "commit", "-m", f"fix: repair {target}"])
     command(["git", "push", "--set-upstream", "origin", branch])
     body = (
-        f"Gemini suggested a repair for `{target}` after `{FAILED_WORKFLOW or 'manual'} run {RUN_ID or 'manual'}`.\n\n"
+        f"Gemini suggested a repair for `{target}` after `{FAILED_WORKFLOW or 'manual'} event {RUN_ID or AUTOFIX_ID}`.\n\n"
         "The full deterministic project checker passed before this PR was created. "
         "Review the diff and CI results before merging. AI-generated changes are suggestions.\n\n"
         f"### Checker output\n```text\n{check_output[:5000]}\n```\n\nModel: `{MODEL}`."
