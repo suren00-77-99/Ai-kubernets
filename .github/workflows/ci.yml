@@ -93,7 +93,7 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: 6. Push image to ECR
+      - name: 6. Push SHA and latest image tags to ECR
         if: github.ref == 'refs/heads/main'
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
@@ -103,10 +103,13 @@ jobs:
           set -euo pipefail
           test -n "$REPOSITORY" || { echo 'Set the ECR_REPOSITORY variable.'; exit 1; }
           docker tag "self-healing-demo:${IMAGE_TAG}" "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          docker tag "self-healing-demo:${IMAGE_TAG}" "${REGISTRY}/${REPOSITORY}:latest"
           docker push "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          docker push "${REGISTRY}/${REPOSITORY}:latest"
 
       - name: 7. Report CD handoff
         if: github.ref == 'refs/heads/main'
         run: |
           echo 'Image published. The CD workflow will request production approval before updating the GitOps branch.' >> "$GITHUB_STEP_SUMMARY"
-          echo "Image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Latest alias: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest" >> "$GITHUB_STEP_SUMMARY"

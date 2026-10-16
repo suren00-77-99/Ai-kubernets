@@ -116,7 +116,7 @@ git push -u origin gitops
 git switch main
 ```
 
-Argo CD watches `gitops`, not `main`. CI/CD source commits and release pins are therefore distinct. The first CD run updates the starter `bootstrap` image value to the SHA-tagged image in ECR.
+Argo CD watches `gitops`, not `main`. CI pushes each scanned image to ECR with both its commit SHA and the mutable `latest` alias. CD pins the unique SHA tag in Helm values so Argo CD sees a change and rolls out each release; `latest` remains available as a convenient alias but is not the deployment reference. The first CD run updates the starter `bootstrap` image value to the SHA-tagged image in ECR.
 
 ## 4. Start the pipeline
 

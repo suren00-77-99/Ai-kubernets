@@ -128,7 +128,16 @@ jobs:
             [[ "$ACTUAL" == *":${IMAGE_TAG}" ]] && break
             sleep 10
           done
-          [[ "$ACTUAL" == *":${IMAGE_TAG}" ]] || { echo "Argo CD did not sync image ${IMAGE_TAG}; current image is ${ACTUAL:-unavailable}"; exit 1; }
+          if [[ "$ACTUAL" != *":${IMAGE_TAG}" ]]; then
+            echo "Argo CD did not sync image ${IMAGE_TAG}; current image is ${ACTUAL:-unavailable}."
+            echo '--- Argo CD Application ---'
+            kubectl describe application self-healing-demo -n argocd || true
+            echo '--- Application namespace resources ---'
+            kubectl get all -n self-healing-demo -o wide || true
+            echo '--- Application namespace events ---'
+            kubectl get events -n self-healing-demo --sort-by=.metadata.creationTimestamp || true
+            exit 1
+          fi
           kubectl rollout status deployment/self-healing-demo -n self-healing-demo --timeout=8m
 
       - name: 5. Roll back GitOps image pin if rollout fails
