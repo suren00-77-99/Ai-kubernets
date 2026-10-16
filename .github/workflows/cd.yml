@@ -76,6 +76,22 @@ jobs:
           test -n "$CLUSTER" || { echo 'Set EKS_CLUSTER_NAME in Actions variables.'; exit 1; }
           aws eks describe-cluster --name "$CLUSTER" --region "$REGION" >/dev/null
           aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+          API_READY=false
+          for attempt in $(seq 1 12); do
+            if kubectl get --raw='/readyz' >/dev/null 2>&1 && kubectl get --raw='/openapi/v2' >/dev/null 2>&1; then
+              API_READY=true
+              break
+            fi
+            echo "Waiting for EKS Kubernetes API and OpenAPI schema (attempt ${attempt}/12)."
+            sleep 10
+          done
+          if [[ "$API_READY" != true ]]; then
+            echo 'EKS API is reachable by AWS, but its Kubernetes readiness/OpenAPI endpoint is not healthy.'
+            aws eks describe-cluster --name "$CLUSTER" --region "$REGION" \
+              --query 'cluster.{status:status,version:version,endpoint:endpoint}' --output table || true
+            kubectl get --raw='/readyz?verbose' || true
+            exit 1
+          fi
 
       - name: 7. Install Argo CD and configure the application
         env:
@@ -130,25 +146,48 @@ jobs:
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
         run: |
           set -euo pipefail
+          kubectl annotate application self-healing-demo -n argocd \
+            argocd.argoproj.io/refresh=hard --overwrite
+          SYNCED=false
+          APP_ERRORS=''
+          ACTUAL=''
           for attempt in $(seq 1 48); do
             APP_JSON="$(kubectl get application self-healing-demo -n argocd -o json 2>/dev/null || true)"
             if [[ -n "$APP_JSON" ]]; then
               APP_ERRORS="$(jq -r '[.status.conditions[]? | select(.type == "ComparisonError" or .type == "InvalidSpecError" or .type == "SyncError" or .type == "UnknownError") | .message] | join("\n")' <<< "$APP_JSON")"
-              if [[ -n "$APP_ERRORS" ]]; then
-                echo "Argo CD reported an application error:"
-                echo "$APP_ERRORS"
-                kubectl describe application self-healing-demo -n argocd || true
-                exit 1
-              fi
+              APP_SYNC="$(jq -r '.status.sync.status // "Unknown"' <<< "$APP_JSON")"
+              APP_HEALTH="$(jq -r '.status.health.status // "Unknown"' <<< "$APP_JSON")"
+            else
+              APP_SYNC='Unknown'
+              APP_HEALTH='Unknown'
             fi
             ACTUAL="$(kubectl get deployment self-healing-demo -n self-healing-demo -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
-            [[ "$ACTUAL" == *":${IMAGE_TAG}" ]] && break
+            if [[ "$APP_SYNC" == 'Synced' && "$APP_HEALTH" == 'Healthy' && "$ACTUAL" == *":${IMAGE_TAG}" ]]; then
+              SYNCED=true
+              break
+            fi
+            echo "Waiting for Argo CD: sync=${APP_SYNC}, health=${APP_HEALTH}, image=${ACTUAL:-unavailable} (attempt ${attempt}/48)."
             sleep 10
           done
-          if [[ "$ACTUAL" != *":${IMAGE_TAG}" ]]; then
-            echo "Argo CD did not sync image ${IMAGE_TAG}; current image is ${ACTUAL:-unavailable}."
+          if [[ "$SYNCED" != true ]]; then
+            echo "Argo CD did not reach Synced/Healthy with image ${IMAGE_TAG}."
+            if [[ -n "$APP_ERRORS" ]]; then
+              echo '--- Argo CD Application errors ---'
+              echo "$APP_ERRORS"
+            fi
             echo '--- Argo CD Application ---'
             kubectl describe application self-healing-demo -n argocd || true
+            echo '--- EKS API readiness ---'
+            kubectl get --raw='/readyz?verbose' || true
+            echo '--- EKS OpenAPI schema probe ---'
+            if kubectl get --raw='/openapi/v2' >/dev/null 2>&1; then
+              echo 'OpenAPI v2 responds successfully from the CD runner.'
+            else
+              echo 'OpenAPI v2 still fails from the CD runner.'
+            fi
+            echo '--- Argo CD application controller logs ---'
+            kubectl logs -n argocd statefulset/argocd-application-controller \
+              --all-containers --since=20m --tail=100 || true
             echo '--- Application namespace resources ---'
             kubectl get all -n self-healing-demo -o wide || true
             echo '--- Application namespace events ---'

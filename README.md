@@ -139,6 +139,22 @@ Review the diff and CI results as you would any other code. The agent cannot mer
 
 If the new deployment does not report the expected SHA image or Kubernetes does not complete the rollout, CD commits the previously pinned image tag back to `gitops`. Argo CD then reconciles the prior tag. The workflow remains failed so the deployment problem is visible. This is a basic teaching rollback; production systems should also use canary/blue-green rollout analysis, alerting, and a durable release history.
 
+### EKS OpenAPI errors
+
+`https://kubernetes.default.svc` is the normal in-cluster Kubernetes API address for Argo CD; it is not a local machine. If Argo CD reports that the API server cannot serve OpenAPI resources, check the EKS control plane and Argo controller before changing Helm resources. From a machine configured with `kubectl` for the cluster, run:
+
+```sh
+aws eks describe-cluster --name suren-eks-cluster --region ap-south-1 \
+  --query 'cluster.{status:status,version:version,endpoint:endpoint}'
+kubectl get --raw='/readyz?verbose'
+kubectl get --raw='/openapi/v2' >/dev/null && echo OPENAPI_OK || echo OPENAPI_FAILED
+kubectl get pods -n argocd -o wide
+kubectl logs -n argocd statefulset/argocd-application-controller \
+  --all-containers --since=30m --tail=100
+```
+
+If `/readyz` or `/openapi/v2` fails from `kubectl`, the problem is at the EKS API/control-plane layer; review EKS cluster health and API server control-plane logs in CloudWatch, and contact AWS Support if it remains unhealthy. If those checks pass but Argo still fails, use the application-controller logs to investigate its in-cluster path to the API. CD now checks API readiness, requests an Argo hard refresh, waits for `Synced` and `Healthy`, and prints these diagnostics on failure.
+
 ## What it can and cannot repair
 
 The Gemini workflow is a bounded repair proposal, not an autonomous production operator. It only attempts allowlisted file-level failures identified in CI or CD logs. It will not fix an unavailable AWS service, missing IAM permission, exhausted quota, broken GitHub runner, or vulnerability findings that require dependency/version decisions. A workflow YAML syntax error may prevent GitHub from starting the workflow, so no `workflow_run` event exists for the repair workflow to handle it. Model output is untrusted until reviewed and merged.
