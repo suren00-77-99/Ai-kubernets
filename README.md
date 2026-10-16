@@ -1,6 +1,6 @@
 # AI-Assisted Self-Healing DevOps on EKS
 
-An educational GitHub Actions project that validates an application, scans and builds a Docker image, pushes it to Amazon ECR, and uses Argo CD with Helm to deploy to Amazon EKS. When a supported file check fails, a Gemini agent may propose a repair in a pull request. A person reviews every AI change before merge.
+An educational GitHub Actions project that validates an application, scans and builds a Docker image, pushes it to Amazon ECR, and uses Argo CD with Helm to deploy to Amazon EKS. When a CI or CD failure points to a supported project file, Gemini may propose a repair in a pull request. A person reviews every AI change before merge.
 
 > The project creates AWS resources and can incur charges. Run it in a sandbox AWS account. Never commit API keys, AWS credentials, or kubeconfig files.
 
@@ -19,7 +19,8 @@ flowchart TD
   I --> J[Argo CD syncs Helm chart]
   J --> K[Kubernetes rollout and app URL]
   K -->|failure| L[Restore prior image tag on gitops branch]
-  B -->|check failure| M[Gemini proposes one allowlisted file repair]
+  B -->|file-related failure| M[Gemini proposes one allowlisted file repair]
+  J -->|file-related failure| M
   M --> N[Run checks again]
   N --> O[Open pull request for human review]
 ```
@@ -101,7 +102,7 @@ You can also use this as a subdirectory in an existing repository, but adjust wo
 | `ECR_REPOSITORY` | Variable | `self-healing-demo` (repository name only) |
 | `EKS_CLUSTER_NAME` | Variable | `suren-eks-cluster` |
 
-The current Gemini model default is `gemini-3.8-flash`; set `GEMINI_MODEL` in the autofix workflow if you want another model available to your account. The Gemini API is only called after a supported file-level CI failure is identified.
+Add `GEMINI_API_KEY` as a repository secret; do not put the key in a workflow file. The current Gemini model default is `gemini-3.8-flash`; set `GEMINI_MODEL` in the autofix workflow if you want another model. Gemini is called only when a failed CI or CD log identifies one supported file.
 
 Create a GitHub Actions **environment** named `production` and configure required reviewers. The CD job pauses before AWS or cluster changes until a reviewer approves it. In **Settings → Actions → General**, allow GitHub Actions to create pull requests and grant the repository token read/write contents permissions. The deploy workflow writes the image pin to `gitops`; allow that branch to be updated by Actions.
 
@@ -130,7 +131,7 @@ Argo CD and Helm are bootstrapped once and then retained. Reinstalling them on e
 
 ## 5. Demonstrate AI-assisted repair
 
-Use a disposable feature branch. Make a small syntax or structure error in `app/index.html`, a Python checker, a YAML file, the Dockerfile, or the Helm chart, then push it to GitHub. The CI job fails before deployment. The separate AI workflow reads the failed run log, copies only one allowlisted file from the failed commit, asks Gemini for a complete-file candidate, and runs the full deterministic checker again. If all checks pass, it opens a PR containing only that target file.
+Use a disposable feature branch. Make a small syntax or structure error in an application, checker, workflow, Argo CD, or Helm file, then push it to GitHub. The AI workflow listens for failed CI and CD runs, reads the failed log, selects one allowlisted file, asks Gemini for a complete-file candidate, and runs the project checker, unit tests, and Docker build. If all pass, it opens a PR containing only that file. Infrastructure/API availability failures and scans without a clear file target do not trigger a speculative repair.
 
 Review the diff and CI results as you would any other code. The agent cannot merge the PR or deploy it. Do not put secrets or production data into test files. To test manually, dispatch **AI Autofix PR** and optionally specify an allowlisted `target_file`.
 
@@ -140,7 +141,7 @@ If the new deployment does not report the expected SHA image or Kubernetes does 
 
 ## What it can and cannot repair
 
-The Gemini workflow is a bounded repair proposal, not an autonomous production operator. It only attempts allowlisted file-level failures identified in CI logs. It will not fix an unavailable AWS service, missing IAM permission, exhausted quota, broken GitHub runner, or vulnerability findings that require dependency/version decisions. A workflow YAML syntax error may prevent GitHub from starting the CI workflow, so no `workflow_run` event exists for the repair workflow to handle it. Model output is untrusted until reviewed and merged.
+The Gemini workflow is a bounded repair proposal, not an autonomous production operator. It only attempts allowlisted file-level failures identified in CI or CD logs. It will not fix an unavailable AWS service, missing IAM permission, exhausted quota, broken GitHub runner, or vulnerability findings that require dependency/version decisions. A workflow YAML syntax error may prevent GitHub from starting the workflow, so no `workflow_run` event exists for the repair workflow to handle it. Model output is untrusted until reviewed and merged.
 
 ## Cost and safety notes
 

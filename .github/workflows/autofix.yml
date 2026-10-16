@@ -2,7 +2,7 @@ name: AI Autofix PR
 
 on:
   workflow_run:
-    workflows: [CI]
+    workflows: [CI, CD]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -60,6 +60,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           FAILED_SHA: ${{ github.event.workflow_run.head_sha }}
+          FAILED_WORKFLOW: ${{ github.event.workflow_run.name }}
           BASE_BRANCH: main
           TARGET_FILE: ${{ inputs.target_file }}
         run: python .github/scripts/autofix.py

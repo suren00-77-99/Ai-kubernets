@@ -14,6 +14,7 @@ MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 RUN_ID = os.getenv("RUN_ID", "")
 FAILED_SHA = os.getenv("FAILED_SHA", "")
 BASE_BRANCH = os.getenv("BASE_BRANCH", "main")
+FAILED_WORKFLOW = os.getenv("FAILED_WORKFLOW", "")
 MAX_LOG = 12_000
 BEGIN, END = "<<<BEGIN_FILE>>>", "<<<END_FILE>>>"
 
@@ -24,9 +25,11 @@ def allowed(path_text):
         return False
     name = path.as_posix()
     return (
-        name == "Dockerfile"
+        name in {"Dockerfile", "nginx.conf", "check.sh", "run-local.sh"}
         or name.startswith("app/")
         or name.startswith("checks/") and name.endswith(".py")
+        or name.startswith("tests/") and name.endswith(".py")
+        or name.startswith("argocd/") and name.endswith((".yml", ".yaml"))
         or name.startswith("helm/app/")
         or name.startswith(".github/workflows/") and name.endswith((".yml", ".yaml"))
         or name.startswith(".github/scripts/") and name.endswith(".py")
@@ -45,21 +48,29 @@ def failure_context():
         return "Manual run: diagnose the current repository checks."
     result = command(["gh", "run", "view", RUN_ID, "--log-failed"], check=False)
     log = (result.stdout or result.stderr)[-MAX_LOG:]
-    return log
+    label = f"Failed workflow: {FAILED_WORKFLOW}\n" if FAILED_WORKFLOW else ""
+    return label + log
 
 
 def choose_target(log):
     manual = os.getenv("TARGET_FILE", "").strip()
     if manual:
         return manual if allowed(manual) else None
-    # Our checker emits FAIL <path>; build output for a Dockerfile error also
-    # commonly names Dockerfile. Avoid guessing at unrelated infrastructure failures.
+    # File-aware checks emit FAIL <path>. Do not guess at infrastructure or
+    # security-scan failures that do not identify a repairable source file.
     for line in log.splitlines():
-        match = re.search(r"\bFAIL\s+([^\s:]+)", line)
+        match = re.search(r"\bFAIL\s+(?:Python syntax:\s*)?([^\s:]+)", line)
         if match and allowed(match.group(1)):
             return match.group(1)
-    if "Dockerfile" in log and allowed("Dockerfile"):
-        return "Dockerfile"
+    # Some build/Helm errors name the file without using the checker's FAIL format.
+    tracked_files = command(["git", "ls-files"], check=False).stdout.splitlines()
+    error_words = re.compile(r"\b(error|failed|failure|invalid|cannot|unable)\b", re.I)
+    for line in log.splitlines():
+        if not error_words.search(line):
+            continue
+        matches = [name for name in tracked_files if allowed(name) and name in line]
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 
@@ -108,7 +119,7 @@ def create_pr(target, check_output):
     command(["git", "commit", "-m", f"fix: repair {target}"])
     command(["git", "push", "--set-upstream", "origin", branch])
     body = (
-        f"Gemini suggested a repair for `{target}` after CI run `{RUN_ID or 'manual'}`.\n\n"
+        f"Gemini suggested a repair for `{target}` after `{FAILED_WORKFLOW or 'manual'} run {RUN_ID or 'manual'}`.\n\n"
         "The full deterministic project checker passed before this PR was created. "
         "Review the diff and CI results before merging. AI-generated changes are suggestions.\n\n"
         f"### Checker output\n```text\n{check_output[:5000]}\n```\n\nModel: `{MODEL}`."
@@ -123,7 +134,7 @@ def main():
     log = failure_context()
     target = choose_target(log)
     if not target:
-        print("No allowlisted source file was identified in the failure log; Gemini was not called and no PR was opened.")
+        print("No allowlisted file failure was identified; this may be an infrastructure or scan failure. Gemini was not called and no PR was opened.")
         print(log[-2500:])
         return 0
     if not allowed(target):
@@ -138,10 +149,17 @@ def main():
     destination = ROOT / target
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(candidate, encoding="utf-8")
-    result = command([sys.executable, "checks/check_project.py"], check=False)
-    output = (result.stdout + result.stderr).strip()
+    results = [
+        command([sys.executable, "checks/check_project.py"], check=False),
+        command(
+            [sys.executable, "-m", "unittest", "discover", "--start-directory", "tests", "--pattern", "test_*.py", "--verbose"],
+            check=False,
+        ),
+        command(["docker", "build", "--tag", "self-healing-demo:autofix", "."], check=False),
+    ]
+    output = "\n\n".join((result.stdout + result.stderr).strip() for result in results)
     print(output)
-    if result.returncode:
+    if any(result.returncode for result in results):
         print("Candidate failed validation; no PR will be opened.")
         return 1
     return create_pr(target, output)

@@ -31,19 +31,19 @@ jobs:
     timeout-minutes: 35
     environment: production
     steps:
-      - name: Checkout trusted default branch
+      - name: 1. Checkout deployment files
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Helm
+      - name: 2. Install Helm CLI
         uses: azure/setup-helm@v5
         with:
           version: v3.18.4
 
-      - name: Select image SHA
+      - name: 3. Select image SHA
         id: image
         env:
           DISPATCH_TAG: ${{ inputs.image_tag }}
@@ -54,13 +54,13 @@ jobs:
           [[ "$IMAGE_TAG" =~ ^[0-9a-f]{7,40}$ ]] || { echo 'Invalid image tag; use a commit SHA.'; exit 1; }
           echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Configure AWS credentials with GitHub OIDC
+      - name: 4. Connect to AWS with GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_CD_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: 1. Validate EKS cluster access
+      - name: 5. Connect to the EKS cluster
         env:
           CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
           REGION: ${{ vars.AWS_REGION }}
@@ -70,7 +70,7 @@ jobs:
           aws eks describe-cluster --name "$CLUSTER" --region "$REGION" >/dev/null
           aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
 
-      - name: 2. Install Argo CD once when absent
+      - name: 6. Install Argo CD and configure the application
         env:
           REPOSITORY: ${{ github.repository }}
         run: |
@@ -94,7 +94,7 @@ jobs:
           kubectl apply -f /tmp/self-healing-application.yaml
           kubectl get application self-healing-demo -n argocd
 
-      - name: 3. Prepare Helm image values on GitOps branch
+      - name: 7. Point Helm at the new image on the GitOps branch
         id: update
         env:
           IMAGE_REPOSITORY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPOSITORY }}
@@ -118,12 +118,22 @@ jobs:
             git push origin HEAD:gitops
           fi
 
-      - name: 4. Wait for Argo CD sync and Kubernetes rollout
+      - name: 8. Wait for Argo CD and Kubernetes rollout
         env:
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
         run: |
           set -euo pipefail
           for attempt in $(seq 1 48); do
+            APP_JSON="$(kubectl get application self-healing-demo -n argocd -o json 2>/dev/null || true)"
+            if [[ -n "$APP_JSON" ]]; then
+              APP_ERRORS="$(jq -r '[.status.conditions[]? | select(.type == "ComparisonError" or .type == "InvalidSpecError" or .type == "SyncError" or .type == "UnknownError") | .message] | join("\n")' <<< "$APP_JSON")"
+              if [[ -n "$APP_ERRORS" ]]; then
+                echo "Argo CD reported an application error:"
+                echo "$APP_ERRORS"
+                kubectl describe application self-healing-demo -n argocd || true
+                exit 1
+              fi
+            fi
             ACTUAL="$(kubectl get deployment self-healing-demo -n self-healing-demo -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
             [[ "$ACTUAL" == *":${IMAGE_TAG}" ]] && break
             sleep 10
@@ -140,31 +150,26 @@ jobs:
           fi
           kubectl rollout status deployment/self-healing-demo -n self-healing-demo --timeout=8m
 
-      - name: 5. Roll back GitOps image pin if rollout fails
+      - name: 9. Restore the previous image if deployment fails
         if: failure() && steps.update.outputs.previous_tag != '' && steps.update.outputs.previous_tag != 'bootstrap'
         env:
           PREVIOUS_TAG: ${{ steps.update.outputs.previous_tag }}
           IMAGE_REPOSITORY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPOSITORY }}
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check PyYAML
           git fetch origin gitops
           git checkout -B gitops origin/gitops
-          PREVIOUS_TAG="$PREVIOUS_TAG" IMAGE_REPOSITORY="$IMAGE_REPOSITORY" python - <<'PY'
-          import os, yaml
-          from pathlib import Path
-          path = Path('helm/app/values.yaml')
-          data = yaml.safe_load(path.read_text())
-          data['image']['repository'] = os.environ['IMAGE_REPOSITORY']
-          data['image']['tag'] = os.environ['PREVIOUS_TAG']
-          path.write_text(yaml.safe_dump(data, sort_keys=False))
-          PY
+          IMAGE_REPOSITORY="$IMAGE_REPOSITORY" python .github/scripts/update_image.py "$PREVIOUS_TAG"
           git add helm/app/values.yaml
-          git commit -m "rollback: restore image ${PREVIOUS_TAG}" || exit 0
+          if git diff --cached --quiet; then
+            echo 'GitOps already points to the previous image.'
+            exit 0
+          fi
+          git commit -m "rollback: restore image ${PREVIOUS_TAG}"
           git push origin HEAD:gitops
-          echo 'Rollback image pin committed; Argo CD will sync the previous release.'
+          echo "Restored image ${PREVIOUS_TAG} on gitops. Argo CD will reconcile it."
 
-      - name: 6. Report application URL
+      - name: 10. Report application URL
         if: success()
         run: |
           set -euo pipefail
