@@ -124,8 +124,8 @@ Argo CD watches `gitops`, not `main`. CI pushes each scanned image to ECR with b
 1. Commit and push a change to `main`.
 2. In **Actions → CI**, follow the ordered stages: checkout, lint, unit tests, Docker build, image scan, ECR repository ensure/create, and ECR push.
 3. After CI succeeds, **Actions → CD** waits at the `production` environment approval gate.
-4. Approve the deployment. CD validates EKS, installs Helm CLI, installs Argo CD only if it is not already present, applies the Argo Application, and updates `helm/app/values.yaml` on `gitops` to the exact commit SHA.
-5. Argo CD automatically syncs the Helm chart. CD waits for the Kubernetes rollout and reports the load balancer URL in the workflow summary.
+4. Approve the deployment. CD checks out the source, installs Helm CLI, lints and packages the Helm chart, then connects to EKS and installs Argo CD if it is missing. It applies the Argo Application and updates `helm/app/values.yaml` on `gitops` to the exact image SHA.
+5. Argo CD reads the Helm chart from the `gitops` branch and syncs the application. CD waits for the Kubernetes rollout. The LoadBalancer Service listens on port 8080, and the workflow summary reports the URL with `:8080`. The package step validates/builds a chart archive in the workflow runner; Argo CD deploys from Git.
 
 Argo CD and Helm are bootstrapped once and then retained. Reinstalling them on every release is unnecessary. Argo CD's automated sync makes the Helm chart on `gitops` the desired state.
 

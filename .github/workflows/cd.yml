@@ -43,7 +43,14 @@ jobs:
         with:
           version: v3.18.4
 
-      - name: 3. Select image SHA
+      - name: 3. Lint and package the Helm chart
+        run: |
+          set -euo pipefail
+          helm lint helm/app
+          mkdir -p /tmp/helm-packages
+          helm package helm/app --destination /tmp/helm-packages
+
+      - name: 4. Select image SHA
         id: image
         env:
           DISPATCH_TAG: ${{ inputs.image_tag }}
@@ -54,13 +61,13 @@ jobs:
           [[ "$IMAGE_TAG" =~ ^[0-9a-f]{7,40}$ ]] || { echo 'Invalid image tag; use a commit SHA.'; exit 1; }
           echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: 4. Connect to AWS with GitHub OIDC
+      - name: 5. Connect to AWS with GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_CD_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: 5. Connect to the EKS cluster
+      - name: 6. Connect to the EKS cluster
         env:
           CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
           REGION: ${{ vars.AWS_REGION }}
@@ -70,7 +77,7 @@ jobs:
           aws eks describe-cluster --name "$CLUSTER" --region "$REGION" >/dev/null
           aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
 
-      - name: 6. Install Argo CD and configure the application
+      - name: 7. Install Argo CD and configure the application
         env:
           REPOSITORY: ${{ github.repository }}
         run: |
@@ -94,7 +101,7 @@ jobs:
           kubectl apply -f /tmp/self-healing-application.yaml
           kubectl get application self-healing-demo -n argocd
 
-      - name: 7. Point Helm at the new image on the GitOps branch
+      - name: 8. Point Helm at the new image on the GitOps branch
         id: update
         env:
           IMAGE_REPOSITORY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPOSITORY }}
@@ -118,7 +125,7 @@ jobs:
             git push origin HEAD:gitops
           fi
 
-      - name: 8. Wait for Argo CD and Kubernetes rollout
+      - name: 9. Wait for Argo CD sync and Kubernetes rollout
         env:
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
         run: |
@@ -150,7 +157,7 @@ jobs:
           fi
           kubectl rollout status deployment/self-healing-demo -n self-healing-demo --timeout=8m
 
-      - name: 9. Restore the previous image if deployment fails
+      - name: 10. Restore the previous image if deployment fails
         if: failure() && steps.update.outputs.previous_tag != '' && steps.update.outputs.previous_tag != 'bootstrap'
         env:
           PREVIOUS_TAG: ${{ steps.update.outputs.previous_tag }}
@@ -169,7 +176,7 @@ jobs:
           git push origin HEAD:gitops
           echo "Restored image ${PREVIOUS_TAG} on gitops. Argo CD will reconcile it."
 
-      - name: 10. Report application URL
+      - name: 11. Report application URL
         if: success()
         run: |
           set -euo pipefail
@@ -179,7 +186,7 @@ jobs:
             sleep 10
           done
           if [ -n "${URL:-}" ]; then
-            echo "Application URL: http://${URL}" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Application URL: http://${URL}:8080" | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo 'Deployment is healthy; the AWS load balancer hostname is still provisioning.' | tee -a "$GITHUB_STEP_SUMMARY"
           fi

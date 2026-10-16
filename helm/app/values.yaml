@@ -1,11 +1,11 @@
 replicaCount: 2
 image:
-  repository: 000000000000.dkr.ecr.ap-south-1.amazonaws.com/self-healing-demo
+  repository: 322686612450.dkr.ecr.ap-south-1.amazonaws.com/self-healing-demo
   tag: bootstrap
   pullPolicy: IfNotPresent
 service:
   type: LoadBalancer
-  port: 80
+  port: 8080
   targetPort: 8080
 resources:
   requests:
