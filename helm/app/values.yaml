@@ -1,7 +1,7 @@
 replicaCount: 2
 image:
   repository: 322686612450.dkr.ecr.ap-south-1.amazonaws.com/self-healing-demo
-  tag: 967de71f0c5624f0e9318ee5319c76d0e03cdf08
+  tag: fd601519433c560bd6648ab0a801540f525f5f4c
   pullPolicy: IfNotPresent
 service:
   type: LoadBalancer
